@@ -25,12 +25,14 @@ class _OnnxMotionModel(nn.Module):
   def __init__(self, actor, motion):
     super().__init__()
     self.policy = actor.as_onnx()
+    frames = torch.arange(motion.time_step_total, device=motion.joint_pos.device)
+    body_pos_w, body_quat_w, body_lin_vel_w, body_ang_vel_w = motion.body_state(frames)
     self.register_buffer("joint_pos", motion.joint_pos.to("cpu"))
     self.register_buffer("joint_vel", motion.joint_vel.to("cpu"))
-    self.register_buffer("body_pos_w", motion.body_pos_w.to("cpu"))
-    self.register_buffer("body_quat_w", motion.body_quat_w.to("cpu"))
-    self.register_buffer("body_lin_vel_w", motion.body_lin_vel_w.to("cpu"))
-    self.register_buffer("body_ang_vel_w", motion.body_ang_vel_w.to("cpu"))
+    self.register_buffer("body_pos_w", body_pos_w.to("cpu"))
+    self.register_buffer("body_quat_w", body_quat_w.to("cpu"))
+    self.register_buffer("body_lin_vel_w", body_lin_vel_w.to("cpu"))
+    self.register_buffer("body_ang_vel_w", body_ang_vel_w.to("cpu"))
     self.time_step_total: int = self.joint_pos.shape[0]
 
   def forward(self, x, time_step):

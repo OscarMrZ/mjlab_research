@@ -34,18 +34,15 @@ Convert a CSV to the NPZ format mjlab expects:
        --output-fps 50 \
        --render True
 
-The script plays the motion through MuJoCo Warp, computes forward kinematics
-for every body, and uploads the resulting NPZ to your WandB registry.
+The script resamples the motion to the output frame rate and uploads the
+resulting NPZ to your WandB registry.
 
 .. warning::
 
-   You **must** use mjlab's converter (``mjlab.scripts.csv_to_npz``).
-   Converters from other frameworks such as IsaacLab produce NPZ files with
-   incompatible body orderings. The NPZ stores precomputed body positions and
-   quaternions indexed by body number, and different physics engines assign
-   body indices differently (MuJoCo uses depth first traversal, PhysX uses
-   breadth first). A mismatched NPZ will map tracking targets to the wrong
-   bodies and training will not converge.
+   You **must** use mjlab's converter (``mjlab.scripts.csv_to_npz``). The NPZ
+   stores the root link's world pose and twist and the joint states, with
+   ``joint_names`` in column order; loading raises unless those names equal the
+   robot's joint names, so NPZ files from other frameworks do not load.
 
 Training
 --------

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import copy
+import glob as globmod
+import json
 import math
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -9,6 +12,7 @@ import numpy as np
 import torch
 
 from mjlab.managers import CommandTerm, CommandTermCfg
+from mjlab.utils.forward_kinematics import ForwardKinematics
 from mjlab.utils.lab_api.math import (
   matrix_from_quat,
   quat_apply,
@@ -33,31 +37,96 @@ if TYPE_CHECKING:
 _DESIRED_FRAME_COLORS = ((1.0, 0.5, 0.5), (0.5, 1.0, 0.5), (0.5, 0.5, 1.0))
 
 
+def _resolve_motion_file(source: str | list[str]) -> list[str]:
+  """Resolve motion source to list of file paths."""
+  if isinstance(source, list):
+    return source
+  if any(c in source for c in "*?[]"):
+    files = sorted(globmod.glob(source))
+    if not files:
+      raise ValueError(f"No files matched pattern: {source}")
+    return files
+  return [source]
+
+
 class MotionLoader:
+  """Loads reference motion as concatenated per-frame tensors on ``device``: the
+  root link's world pose and twist and the joint positions and velocities.
+  ``body_state`` computes the tracked bodies from them with ``fk``. Motion files
+  hold them as ``root_pos_w``, ``root_quat_w`` (wxyz), ``root_lin_vel_w``,
+  ``root_ang_vel_w``, ``joint_pos`` and ``joint_vel``, with ``joint_names``, which
+  must equal ``fk.joint_names``.
+
+  ``motion_file`` is either per-clip ``.npz`` files (one file, a comma list, or a
+  glob, concatenated in sorted order) or a single packed directory written by
+  ``scripts/pack_motions.py`` (one ``<field>.npy`` plus ``motion_ends.npy`` and
+  ``joint_names.json``). The packed directory loads with a few sequential reads
+  instead of opening tens of thousands of clips, so it is the path for large
+  datasets; ``.npz`` clips remain for registry motions, single clips, and tests.
+  """
+
   def __init__(
-    self, motion_file: str, body_indexes: torch.Tensor, device: str = "cpu"
+    self, motion_file: str | list[str], fk: ForwardKinematics, device: str = "cpu"
   ) -> None:
-    data = np.load(motion_file)
-    self.joint_pos = torch.tensor(data["joint_pos"], dtype=torch.float32, device=device)
-    self.joint_vel = torch.tensor(data["joint_vel"], dtype=torch.float32, device=device)
-    self._body_pos_w = torch.tensor(
-      data["body_pos_w"], dtype=torch.float32, device=device
-    )
-    self._body_quat_w = torch.tensor(
-      data["body_quat_w"], dtype=torch.float32, device=device
-    )
-    self._body_lin_vel_w = torch.tensor(
-      data["body_lin_vel_w"], dtype=torch.float32, device=device
-    )
-    self._body_ang_vel_w = torch.tensor(
-      data["body_ang_vel_w"], dtype=torch.float32, device=device
-    )
-    self._body_indexes = body_indexes
-    self.body_pos_w = self._body_pos_w[:, self._body_indexes]
-    self.body_quat_w = self._body_quat_w[:, self._body_indexes]
-    self.body_lin_vel_w = self._body_lin_vel_w[:, self._body_indexes]
-    self.body_ang_vel_w = self._body_ang_vel_w[:, self._body_indexes]
+    files = _resolve_motion_file(motion_file)
+
+    packed = len(files) == 1 and os.path.isdir(files[0])
+    if packed:
+      root = files[0]
+      clips: list[dict] = []
+      motion_ends = np.load(os.path.join(root, "motion_ends.npy"))
+      with open(os.path.join(root, "joint_names.json")) as fh:
+        clip_joints = [json.load(fh)]
+      names_path = os.path.join(root, "motion_names.json")
+      names = None
+      if os.path.exists(names_path):
+        with open(names_path) as fh:
+          names = json.load(fh)
+    else:
+      root = ""
+      clips = [dict(np.load(path)) for path in files]
+      clip_joints = [clip["joint_names"].tolist() for clip in clips]
+      motion_ends = np.cumsum([clip["joint_pos"].shape[0] for clip in clips])
+      names = [os.path.splitext(os.path.basename(p))[0] for p in files]
+
+    for joints in clip_joints:
+      if joints != fk.joint_names:
+        raise ValueError(f"motion joints {joints} are not the robot's {fk.joint_names}")
+
+    def field(name: str) -> np.ndarray:
+      if packed:
+        return np.load(os.path.join(root, f"{name}.npy"))
+      return np.concatenate([clip[name] for clip in clips])
+
+    def to_device(arr: np.ndarray) -> torch.Tensor:
+      return torch.from_numpy(arr).to(device=device, dtype=torch.float32)
+
+    self.root_pos_w = to_device(field("root_pos_w"))
+    self.root_quat_w = to_device(field("root_quat_w"))
+    self.root_lin_vel_w = to_device(field("root_lin_vel_w"))
+    self.root_ang_vel_w = to_device(field("root_ang_vel_w"))
+    self.joint_pos = to_device(field("joint_pos"))
+    self.joint_vel = to_device(field("joint_vel"))
+    self.fk = fk
     self.time_step_total = self.joint_pos.shape[0]
+    self.motion_ends = torch.as_tensor(motion_ends, dtype=torch.long, device=device)
+    if names is None:
+      names = [f"clip_{i}" for i in range(len(self.motion_ends))]
+    self.motion_names: list[str] = names
+
+  def body_state(
+    self, frames: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """World positions, wxyz quaternions, linear and angular velocities of the
+    tracked bodies at ``frames``, without env origins."""
+    return self.fk(
+      self.root_pos_w[frames],
+      self.root_quat_w[frames],
+      self.joint_pos[frames],
+      self.root_lin_vel_w[frames],
+      self.root_ang_vel_w[frames],
+      self.joint_vel[frames],
+    )
 
 
 class MotionCommand(CommandTerm):
@@ -78,10 +147,29 @@ class MotionCommand(CommandTerm):
       device=self.device,
     )
 
-    self.motion = MotionLoader(
-      self.cfg.motion_file, self.body_indexes, device=self.device
+    fk = ForwardKinematics(
+      env.sim.mj_model,
+      self.robot.indexing.body_ids,
+      self.robot.indexing.joint_q_adr,
+      self.body_indexes,
+      device=self.device,
+    )
+    self.motion = MotionLoader(self.cfg.motion_file, fk, device=self.device)
+    # One fused kernel per call; env subsets of two or more share one graph.
+    self._body_state = torch.compile(
+      self.motion.body_state,
+      dynamic=True,
+      options={"max_fusion_size": 512},
+      disable=not self.device.startswith("cuda"),
     )
     self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+    # The tracked bodies' reference states at ``time_steps``, without env origins.
+    (
+      self._body_pos_w,
+      self._body_quat_w,
+      self._body_lin_vel_w,
+      self._body_ang_vel_w,
+    ) = self._body_state(self.time_steps)
     self.body_pos_relative_w = torch.zeros(
       self.num_envs, len(cfg.body_names), 3, device=self.device
     )
@@ -90,12 +178,17 @@ class MotionCommand(CommandTerm):
     )
     self.body_quat_relative_w[:, :, 0] = 1.0
 
-    self.bin_count = int(self.motion.time_step_total // (1 / env.step_dt)) + 1
+    self.bin_count = int(self.motion.time_step_total // (0.2 / env.step_dt)) + 1
     self.bin_failed_count = torch.zeros(
       self.bin_count, dtype=torch.float, device=self.device
     )
     self._current_bin_failed = torch.zeros(
       self.bin_count, dtype=torch.float, device=self.device
+    )
+    # Per-bin distribution for sampling_mode="external"; the runner pushes this in
+    # via set_sampling_distribution(). Uniform until the first update.
+    self._external_probs = torch.full(
+      (self.bin_count,), 1.0 / self.bin_count, device=self.device
     )
     self.kernel = torch.tensor(
       [self.cfg.adaptive_lambda**i for i in range(self.cfg.adaptive_kernel_size)],
@@ -137,40 +230,37 @@ class MotionCommand(CommandTerm):
 
   @property
   def body_pos_w(self) -> torch.Tensor:
-    return (
-      self.motion.body_pos_w[self.time_steps] + self._env.scene.env_origins[:, None, :]
-    )
+    return self._body_pos_w + self._env.scene.env_origins[:, None, :]
 
   @property
   def body_quat_w(self) -> torch.Tensor:
-    return self.motion.body_quat_w[self.time_steps]
+    return self._body_quat_w
 
   @property
   def body_lin_vel_w(self) -> torch.Tensor:
-    return self.motion.body_lin_vel_w[self.time_steps]
+    return self._body_lin_vel_w
 
   @property
   def body_ang_vel_w(self) -> torch.Tensor:
-    return self.motion.body_ang_vel_w[self.time_steps]
+    return self._body_ang_vel_w
 
   @property
   def anchor_pos_w(self) -> torch.Tensor:
     return (
-      self.motion.body_pos_w[self.time_steps, self.motion_anchor_body_index]
-      + self._env.scene.env_origins
+      self._body_pos_w[:, self.motion_anchor_body_index] + self._env.scene.env_origins
     )
 
   @property
   def anchor_quat_w(self) -> torch.Tensor:
-    return self.motion.body_quat_w[self.time_steps, self.motion_anchor_body_index]
+    return self._body_quat_w[:, self.motion_anchor_body_index]
 
   @property
   def anchor_lin_vel_w(self) -> torch.Tensor:
-    return self.motion.body_lin_vel_w[self.time_steps, self.motion_anchor_body_index]
+    return self._body_lin_vel_w[:, self.motion_anchor_body_index]
 
   @property
   def anchor_ang_vel_w(self) -> torch.Tensor:
-    return self.motion.body_ang_vel_w[self.time_steps, self.motion_anchor_body_index]
+    return self._body_ang_vel_w[:, self.motion_anchor_body_index]
 
   @property
   def robot_joint_pos(self) -> torch.Tensor:
@@ -247,7 +337,30 @@ class MotionCommand(CommandTerm):
       self.joint_vel - self.robot_joint_vel, dim=-1
     )
 
-  def _adaptive_sampling(self, env_ids: torch.Tensor):
+  def _sample_bins(self, env_ids: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
+    """Draw reset frames from a normalized per-bin distribution."""
+    sampled_bins = torch.multinomial(probs, len(env_ids), replacement=True)
+    # Integer, multiply-first bin->frame map. With ~1M bins the old float32
+    # ``ratio * total`` lost precision, and a multinomial overflow to bin_count
+    # could push the frame index out of range. int64 multiply-first is exact,
+    # cannot overflow (b*total < 1e14, well under int64 max), and stays bounded.
+    total = self.motion.time_step_total - 2
+    b = sampled_bins.clamp_(max=self.bin_count - 1)
+    lo = (b * total) // self.bin_count
+    span = (((b + 1) * total) // self.bin_count - lo).clamp_(min=1)
+    jitter = (
+      sample_uniform(0.0, 1.0, (len(env_ids),), device=self.device) * span
+    ).long()
+    entropy = -(probs * (probs + 1e-12).log()).sum()
+    self.metrics["sampling_entropy"][:] = (
+      entropy / math.log(self.bin_count) if self.bin_count > 1 else 1.0
+    )
+    pmax, imax = probs.max(dim=0)
+    self.metrics["sampling_top1_prob"][:] = pmax
+    self.metrics["sampling_top1_bin"][:] = imax.float() / self.bin_count
+    return (lo + jitter).clamp_(max=total)
+
+  def _adaptive_sampling(self, env_ids: torch.Tensor) -> torch.Tensor:
     episode_failed = self._env.termination_manager.terminated[env_ids]
     if torch.any(episode_failed):
       current_bin_index = torch.clamp(
@@ -258,9 +371,13 @@ class MotionCommand(CommandTerm):
       fail_bins = current_bin_index[env_ids][episode_failed]
       self._current_bin_failed[:] = torch.bincount(fail_bins, minlength=self.bin_count)
 
-    # Sample.
-    sampling_probabilities = (
-      self.bin_failed_count + self.cfg.adaptive_uniform_ratio / float(self.bin_count)
+    # Sample. Clip the per-bin failure count at adaptive_clip*mean so no single
+    # bin can dominate the distribution (prevents runaway concentration/forgetting).
+    failed = self.bin_failed_count
+    if self.cfg.adaptive_clip > 0:
+      failed = torch.clamp(failed, max=self.cfg.adaptive_clip * failed.mean())
+    sampling_probabilities = failed + self.cfg.adaptive_uniform_ratio / float(
+      self.bin_count
     )
     sampling_probabilities = torch.nn.functional.pad(
       sampling_probabilities.unsqueeze(0).unsqueeze(0),
@@ -273,30 +390,32 @@ class MotionCommand(CommandTerm):
 
     sampling_probabilities = sampling_probabilities / sampling_probabilities.sum()
 
-    sampled_bins = torch.multinomial(
-      sampling_probabilities, len(env_ids), replacement=True
-    )
-    self.time_steps[env_ids] = (
-      (sampled_bins + sample_uniform(0.0, 1.0, (len(env_ids),), device=self.device))
-      / self.bin_count
-      * (self.motion.time_step_total - 1)
-    ).long()
+    return self._sample_bins(env_ids, sampling_probabilities)
 
-    # Update metrics.
-    H = -(sampling_probabilities * (sampling_probabilities + 1e-12).log()).sum()
-    H_norm = H / math.log(self.bin_count) if self.bin_count > 1 else 1.0
-    pmax, imax = sampling_probabilities.max(dim=0)
-    self.metrics["sampling_entropy"][:] = H_norm
-    self.metrics["sampling_top1_prob"][:] = pmax
-    self.metrics["sampling_top1_bin"][:] = imax.float() / self.bin_count
-
-  def _uniform_sampling(self, env_ids: torch.Tensor):
-    self.time_steps[env_ids] = torch.randint(
-      0, self.motion.time_step_total, (len(env_ids),), device=self.device
-    )
+  def _uniform_sampling(self, env_ids: torch.Tensor) -> torch.Tensor:
     self.metrics["sampling_entropy"][:] = 1.0  # Maximum entropy for uniform.
     self.metrics["sampling_top1_prob"][:] = 1.0 / self.bin_count
     self.metrics["sampling_top1_bin"][:] = 0.5  # No specific bin preference.
+    return torch.randint(
+      0, self.motion.time_step_total - 1, (len(env_ids),), device=self.device
+    )
+
+  def set_sampling_distribution(self, probs: torch.Tensor) -> None:
+    """Set the per-bin reset distribution used by ``sampling_mode='external'``.
+
+    ``probs`` must have length ``bin_count``; it is moved to device, clamped
+    non-negative and renormalized. Invalid inputs are ignored so the previous
+    (or uniform) distribution stays in effect.
+    """
+    probs = probs.detach().to(self.device, dtype=torch.float).clamp_min(0.0)
+    total = probs.sum()
+    if probs.numel() != self.bin_count or not torch.isfinite(total) or total <= 0:
+      return
+    self._external_probs = probs / total
+
+  def _external_sampling(self, env_ids: torch.Tensor) -> torch.Tensor:
+    """Sample reset frames from the externally-provided distribution."""
+    return self._sample_bins(env_ids, self._external_probs)
 
   def _write_reference_state_to_sim(
     self,
@@ -319,17 +438,23 @@ class MotionCommand(CommandTerm):
 
   def _resample_command(self, env_ids: torch.Tensor):
     if self.cfg.sampling_mode == "start":
-      self.time_steps[env_ids] = 0
+      frames = torch.zeros_like(env_ids)
     elif self.cfg.sampling_mode == "uniform":
-      self._uniform_sampling(env_ids)
+      frames = self._uniform_sampling(env_ids)
+    elif self.cfg.sampling_mode == "external":
+      frames = self._external_sampling(env_ids)
     else:
       assert self.cfg.sampling_mode == "adaptive"
-      self._adaptive_sampling(env_ids)
+      frames = self._adaptive_sampling(env_ids)
 
-    root_pos = self.body_pos_w[env_ids, 0].clone()
-    root_ori = self.body_quat_w[env_ids, 0].clone()
-    root_lin_vel = self.body_lin_vel_w[env_ids, 0].clone()
-    root_ang_vel = self.body_ang_vel_w[env_ids, 0].clone()
+    on_last = torch.isin(frames, self.motion.motion_ends - 1)
+    frames = torch.where(on_last, frames - 1, frames)
+    self.set_time_steps(env_ids, frames)
+
+    root_pos = self.motion.root_pos_w[frames] + self._env.scene.env_origins[env_ids]
+    root_ori = self.motion.root_quat_w[frames]
+    root_lin_vel = self.motion.root_lin_vel_w[frames]
+    root_ang_vel = self.motion.root_ang_vel_w[frames]
 
     range_list = [
       self.cfg.pose_range.get(key, (0.0, 0.0))
@@ -376,6 +501,16 @@ class MotionCommand(CommandTerm):
     )
     self._pending_forward = True
 
+  def set_time_steps(self, env_ids: torch.Tensor | slice, frames: torch.Tensor) -> None:
+    """Move ``env_ids`` to ``frames`` and compute their tracked bodies there."""
+    self.time_steps[env_ids] = frames
+    (
+      self._body_pos_w[env_ids],
+      self._body_quat_w[env_ids],
+      self._body_lin_vel_w[env_ids],
+      self._body_ang_vel_w[env_ids],
+    ) = self._body_state(frames)
+
   def update_relative_body_poses(self) -> None:
     """Recompute ``body_pos_relative_w`` and ``body_quat_relative_w``.
 
@@ -414,13 +549,12 @@ class MotionCommand(CommandTerm):
     return extras
 
   def _update_command(self, env_ids: torch.Tensor | None = None):
-    if env_ids is None:
-      self.time_steps += 1
-    else:
-      self.time_steps[env_ids] += 1
+    ids = slice(None) if env_ids is None else env_ids
+    self.time_steps[ids] += 1
     wrap_ids = torch.where(self.time_steps >= self.motion.time_step_total)[0]
     if wrap_ids.numel() > 0:
       self._resample_command(wrap_ids)
+    self.set_time_steps(ids, self.time_steps[ids])
 
     # _resample_command writes qpos/qvel but does not refresh derived
     # quantities; forward() so update_relative_body_poses reads the
@@ -468,12 +602,14 @@ class MotionCommand(CommandTerm):
       joint_q_adr = indexing.joint_q_adr.cpu().numpy()
 
       for batch in env_indices:
+        frame = self.time_steps[batch]
+        root_pos = self.motion.root_pos_w[frame] + self._env.scene.env_origins[batch]
         qpos = np.zeros(self._env.sim.mj_model.nq)
-        qpos[free_joint_q_adr[0:3]] = self.body_pos_w[batch, 0].cpu().numpy()
-        qpos[free_joint_q_adr[3:7]] = self.body_quat_w[batch, 0].cpu().numpy()
+        qpos[free_joint_q_adr[0:3]] = root_pos.cpu().numpy()
+        qpos[free_joint_q_adr[3:7]] = self.motion.root_quat_w[frame].cpu().numpy()
         qpos[joint_q_adr] = self.joint_pos[batch].cpu().numpy()
 
-        visualizer.add_ghost_mesh(
+        visualizer.add_ghost_entity(
           qpos,
           model=self._ghost_model,
           label=f"ghost_{batch}",
@@ -547,8 +683,8 @@ class MotionCommand(CommandTerm):
 
       @scrubber.on_update
       def _(_) -> None:
-        idx = get_env_idx()
-        self.time_steps[idx] = int(scrubber.value)
+        env_ids = torch.tensor([get_env_idx()], device=self.device)
+        self.set_time_steps(env_ids, torch.full_like(env_ids, int(scrubber.value)))
         if on_change is not None:
           on_change()
 
@@ -592,13 +728,14 @@ class MotionCommand(CommandTerm):
     Like ``_resample_command`` but deterministic: no random
     perturbations to pose, velocity, or joint positions.
     """
-    self.time_steps[env_ids] = frame
+    frames = torch.full_like(env_ids, frame)
+    self.set_time_steps(env_ids, frames)
     self._write_reference_state_to_sim(
       env_ids,
-      self.body_pos_w[env_ids, 0],
-      self.body_quat_w[env_ids, 0],
-      self.body_lin_vel_w[env_ids, 0],
-      self.body_ang_vel_w[env_ids, 0],
+      self.motion.root_pos_w[frames] + self._env.scene.env_origins[env_ids],
+      self.motion.root_quat_w[frames],
+      self.motion.root_lin_vel_w[frames],
+      self.motion.root_ang_vel_w[frames],
       self.joint_pos[env_ids],
       self.joint_vel[env_ids],
     )
@@ -606,7 +743,7 @@ class MotionCommand(CommandTerm):
 
 @dataclass(kw_only=True)
 class MotionCommandCfg(CommandTermCfg):
-  motion_file: str
+  motion_file: str | list[str] = ""
   anchor_body_name: str
   body_names: tuple[str, ...]
   entity_name: str
@@ -617,7 +754,8 @@ class MotionCommandCfg(CommandTermCfg):
   adaptive_lambda: float = 0.8
   adaptive_uniform_ratio: float = 0.1
   adaptive_alpha: float = 0.001
-  sampling_mode: Literal["adaptive", "uniform", "start"] = "adaptive"
+  adaptive_clip: float = 100.0
+  sampling_mode: Literal["adaptive", "uniform", "start", "external"] = "adaptive"
 
   @dataclass
   class VizCfg:

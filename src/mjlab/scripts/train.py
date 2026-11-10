@@ -80,7 +80,8 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
     assert isinstance(motion_cmd, MotionCommandCfg)
 
     # Check if motion_file is already set (e.g., via CLI --env.commands.motion.motion-file).
-    if motion_cmd.motion_file and Path(motion_cmd.motion_file).exists():
+    local = motion_cmd.motion_file
+    if isinstance(local, str) and local and Path(local).exists():
       print(f"[INFO] Using local motion file: {motion_cmd.motion_file}")
     elif cfg.registry_name:
       # Download from WandB registry.

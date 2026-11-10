@@ -481,12 +481,21 @@ class _MockMotion:
   """Minimal mock of a motion object with tensor attributes."""
 
   def __init__(self, num_steps, num_joints=12, num_bodies=5):
+    self.time_step_total = num_steps
     self.joint_pos = torch.randn(num_steps, num_joints)
     self.joint_vel = torch.randn(num_steps, num_joints)
     self.body_pos_w = torch.randn(num_steps, num_bodies, 3)
     self.body_quat_w = torch.randn(num_steps, num_bodies, 4)
     self.body_lin_vel_w = torch.randn(num_steps, num_bodies, 3)
     self.body_ang_vel_w = torch.randn(num_steps, num_bodies, 3)
+
+  def body_state(self, frames):
+    return (
+      self.body_pos_w[frames],
+      self.body_quat_w[frames],
+      self.body_lin_vel_w[frames],
+      self.body_ang_vel_w[frames],
+    )
 
 
 def test_onnx_motion_model_policy_matches_actor():
