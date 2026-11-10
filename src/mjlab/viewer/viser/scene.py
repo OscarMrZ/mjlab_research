@@ -274,6 +274,7 @@ class MjlabViserScene(ViserMujocoScene, DebugVisualizer):
     # Queued debug primitives (populated each frame, consumed by sync).
     self._queued_arrows: list = []
     self._queued_ghosts: list = []
+    self._queued_ghost_bodies: list = []
     self._queued_spheres: list = []
     self._queued_cylinders: list = []
     self._queued_ellipsoids: list = []
@@ -968,7 +969,7 @@ class MjlabViserScene(ViserMujocoScene, DebugVisualizer):
     self._queued_arrows.append((start, end, color, width))
 
   @override
-  def add_ghost_mesh(
+  def add_ghost_entity(
     self,
     qpos: np.ndarray | torch.Tensor,
     model: mujoco.MjModel,
@@ -977,18 +978,31 @@ class MjlabViserScene(ViserMujocoScene, DebugVisualizer):
     alpha: float = 0.5,
     label: str | None = None,
   ) -> None:
+    del mocap_pos, mocap_quat
     if not self.debug_visualization_enabled:
       return
     qpos = _to_numpy(qpos)
-    mocap_pos = _to_numpy(mocap_pos) if mocap_pos is not None else None
-    mocap_quat = _to_numpy(mocap_quat) if mocap_quat is not None else None
     self._queued_ghosts.append(
+      (qpos.copy(), model, alpha, label or f"env_{self.env_idx}")
+    )
+
+  @override
+  def add_ghost_bodies(
+    self,
+    model: mujoco.MjModel,
+    body_ids: np.ndarray,
+    body_xpos: np.ndarray,
+    body_xquat: np.ndarray,
+    label: str | None = None,
+  ) -> None:
+    if not self.debug_visualization_enabled:
+      return
+    self._queued_ghost_bodies.append(
       (
-        qpos.copy(),
         model,
-        np.asarray(mocap_pos).copy() if mocap_pos is not None else None,
-        np.asarray(mocap_quat).copy() if mocap_quat is not None else None,
-        alpha,
+        np.asarray(body_ids).copy(),
+        np.asarray(body_xpos).copy(),
+        np.asarray(body_xquat).copy(),
         label or f"env_{self.env_idx}",
       )
     )
@@ -1099,6 +1113,7 @@ class MjlabViserScene(ViserMujocoScene, DebugVisualizer):
     self._queued_ellipsoids.clear()
     self._queued_boxes.clear()
     self._queued_ghosts.clear()
+    self._queued_ghost_bodies.clear()
 
   def clear_debug_all(self) -> None:
     """Clear all debug visualizations including handles."""
@@ -1288,9 +1303,65 @@ class MjlabViserScene(ViserMujocoScene, DebugVisualizer):
       opacity,
     )
 
+  def _collect_ghost_geoms(
+    self,
+    model: mujoco.MjModel,
+    model_id: int,
+    body_data: dict[tuple[int, int], list[tuple[np.ndarray, np.ndarray, np.ndarray]]],
+    body_id_filter: set[int] | None = None,
+  ) -> None:
+    """Collect visible geom transforms from viz_data into body_data.
+
+    Args:
+      model: MuJoCo model for geom metadata.
+      model_id: Identity key for the model (`id(model)`).
+      body_data: Dict to populate with (position, wxyz, color_uint8) tuples.
+      body_id_filter: If provided, only include geoms belonging to these bodies.
+    """
+    body_geoms: dict[int, list[int]] = {}
+    for gi in range(model.ngeom):
+      bid = model.geom_bodyid[gi]
+      if body_id_filter is not None and bid not in body_id_filter:
+        continue
+      if model.geom_rgba[gi, 3] == 0:
+        continue
+      group = int(model.geom_group[gi])
+      if group >= 6 or not self.geom_groups_visible[group]:
+        continue
+      if model.body_dofnum[bid] == 0 and model.body_parentid[bid] == 0:
+        continue
+      body_geoms.setdefault(bid, []).append(gi)
+
+    for bid, bid_geom_ids in body_geoms.items():
+      key = (model_id, bid)
+      body_data.setdefault(key, []).append(
+        (
+          (self._viz_data.xpos[bid] + self._scene_offset).copy(),
+          vtf.SO3.from_matrix(self._viz_data.xmat[bid].reshape(3, 3)).wxyz.copy(),
+          (model.geom_rgba[bid_geom_ids[0]][:3] * 255).astype(np.uint8),
+        )
+      )
+
+      # Cache combined mesh per (model, body).
+      by_model = self._ghost_meshes.setdefault(model_id, {})
+      if bid not in by_model:
+        meshes = []
+        for gid in bid_geom_ids:
+          mesh = _create_geom_mesh(model, gid)
+          if mesh is not None:
+            T = np.eye(4)
+            T[:3, :3] = vtf.SO3(model.geom_quat[gid]).as_matrix()
+            T[:3, 3] = model.geom_pos[gid]
+            mesh.apply_transform(T)
+            meshes.append(mesh)
+        if meshes:
+          by_model[bid] = (
+            meshes[0] if len(meshes) == 1 else trimesh.util.concatenate(meshes)
+          )
+
   def _sync_ghosts(self) -> None:
     """Render queued ghosts as one batched handle per (model, body)."""
-    if not self._queued_ghosts:
+    if not self._queued_ghosts and not self._queued_ghost_bodies:
       for handle in self._ghost_handles.values():
         handle.visible = False
       return
@@ -1301,60 +1372,30 @@ class MjlabViserScene(ViserMujocoScene, DebugVisualizer):
     ] = {}
     alpha_by_model: dict[int, float] = {}
 
-    for qpos, model, mocap_pos, mocap_quat, alpha, _label in self._queued_ghosts:
+    # Process entity ghosts (FK-based).
+    for qpos, model, alpha, _label in self._queued_ghosts:
       model_id = id(model)
       alpha_by_model[model_id] = alpha
 
       # Forward kinematics on the visualization-only MjData.
       self._viz_data.qpos[:] = qpos
-      if mocap_pos is not None and model.nmocap > 0:
-        if mocap_pos.ndim == 1:
-          self._viz_data.mocap_pos[0] = mocap_pos
-        else:
-          self._viz_data.mocap_pos[:] = mocap_pos
-      if mocap_quat is not None and model.nmocap > 0:
-        if mocap_quat.ndim == 1:
-          self._viz_data.mocap_quat[0] = mocap_quat
-        else:
-          self._viz_data.mocap_quat[:] = mocap_quat
       mujoco.mj_forward(model, self._viz_data)
 
-      # Group visible ghost geoms by body.
-      body_geoms: dict[int, list[int]] = {}
-      for gi in range(model.ngeom):
-        if model.geom_rgba[gi, 3] == 0:
-          continue
-        bid = model.geom_bodyid[gi]
-        if model.body_dofnum[bid] == 0 and model.body_parentid[bid] == 0:
-          continue
-        body_geoms.setdefault(bid, []).append(gi)
+      self._collect_ghost_geoms(model, model_id, body_data)
 
-      for bid, bid_geom_ids in body_geoms.items():
-        key = (model_id, bid)
-        body_data.setdefault(key, []).append(
-          (
-            (self._viz_data.xpos[bid] + self._scene_offset).copy(),
-            vtf.SO3.from_matrix(self._viz_data.xmat[bid].reshape(3, 3)).wxyz.copy(),
-            (model.geom_rgba[bid_geom_ids[0]][:3] * 255).astype(np.uint8),
-          )
-        )
+    # Process body ghosts (direct world-frame poses, no FK).
+    for model, body_ids, body_xpos, body_xquat, _label in self._queued_ghost_bodies:
+      model_id = id(model)
+      alpha_by_model.setdefault(model_id, 0.5)
 
-        # Cache combined mesh per (model, body).
-        by_model = self._ghost_meshes.setdefault(model_id, {})
-        if bid not in by_model:
-          meshes = []
-          for gid in bid_geom_ids:
-            mesh = _create_geom_mesh(model, gid)
-            if mesh is not None:
-              T = np.eye(4)
-              T[:3, :3] = vtf.SO3(model.geom_quat[gid]).as_matrix()
-              T[:3, 3] = model.geom_pos[gid]
-              mesh.apply_transform(T)
-              meshes.append(mesh)
-          if meshes:
-            by_model[bid] = (
-              meshes[0] if len(meshes) == 1 else trimesh.util.concatenate(meshes)
-            )
+      for i, bid in enumerate(body_ids):
+        bid_int = int(bid)
+        self._viz_data.xpos[bid_int] = body_xpos[i]
+        mujoco.mju_quat2Mat(self._viz_data.xmat[bid_int], body_xquat[i])
+
+      self._collect_ghost_geoms(
+        model, model_id, body_data, set(int(b) for b in body_ids)
+      )
 
     # Remove stale handles.
     for key in set(self._ghost_handles) - set(body_data):

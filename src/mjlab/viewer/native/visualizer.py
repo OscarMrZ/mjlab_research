@@ -86,7 +86,7 @@ class MujocoNativeDebugVisualizer(DebugVisualizer):
     )
 
   @override
-  def add_ghost_mesh(
+  def add_ghost_entity(
     self,
     qpos: np.ndarray,
     model: mujoco.MjModel,
@@ -95,9 +95,7 @@ class MujocoNativeDebugVisualizer(DebugVisualizer):
     alpha: float = 0.5,
     label: str | None = None,
   ) -> None:
-    """Add a ghost mesh by rendering the robot at a different pose.
-
-    This creates a semi-transparent copy of the robot geometry at the target pose.
+    """Add a ghost entity by rendering it at a different pose via FK.
 
     Args:
       qpos: Joint positions for the ghost pose
@@ -125,6 +123,54 @@ class MujocoNativeDebugVisualizer(DebugVisualizer):
       else:
         self._mj_data.mocap_quat[:] = mocap_quat_arr
     mujoco.mj_forward(model, self._mj_data)
+
+    mujoco.mjv_addGeoms(
+      model,
+      self._mj_data,
+      self._vopt,
+      self._pert,
+      mujoco.mjtCatBit.mjCAT_DYNAMIC.value,
+      self._mjv_scene,
+    )
+
+  @override
+  def add_ghost_bodies(
+    self,
+    model: mujoco.MjModel,
+    body_ids: np.ndarray,
+    body_xpos: np.ndarray,
+    body_xquat: np.ndarray,
+    label: str | None = None,
+  ) -> None:
+    """Add ghost rendering of specific bodies at given world-frame poses.
+
+    Args:
+      model: MuJoCo model with pre-configured appearance (geom_rgba for colors).
+        Non-tracked body geoms should have alpha=0 to hide them from mjv_addGeoms.
+      body_ids: MuJoCo body IDs to render. Shape: (B,).
+      body_xpos: World-frame positions for each body. Shape: (B, 3).
+      body_xquat: World-frame quaternions (wxyz) for each body. Shape: (B, 4).
+      label: Optional label (not used in MuJoCo implementation).
+    """
+    del label  # Unused.
+
+    # Set body transforms directly (no FK needed)
+    for i, bid in enumerate(body_ids):
+      self._mj_data.xpos[bid] = body_xpos[i]
+      mujoco.mju_quat2Mat(self._mj_data.xmat[bid], body_xquat[i])
+
+    # Compute geom world transforms for tracked bodies
+    body_id_set = set(int(b) for b in body_ids)
+    for g in range(model.ngeom):
+      b = model.geom_bodyid[g]
+      if b in body_id_set:
+        body_mat = self._mj_data.xmat[b].reshape(3, 3)
+        self._mj_data.geom_xpos[g] = (
+          self._mj_data.xpos[b] + body_mat @ model.geom_pos[g]
+        )
+        geom_mat = np.zeros(9)
+        mujoco.mju_quat2Mat(geom_mat, model.geom_quat[g])
+        self._mj_data.geom_xmat[g] = (body_mat @ geom_mat.reshape(3, 3)).flatten()
 
     mujoco.mjv_addGeoms(
       model,

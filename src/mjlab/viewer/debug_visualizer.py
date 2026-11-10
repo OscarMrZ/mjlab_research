@@ -71,7 +71,7 @@ class DebugVisualizer(ABC):
     ...
 
   @abstractmethod
-  def add_ghost_mesh(
+  def add_ghost_entity(
     self,
     qpos: np.ndarray,
     model: mujoco.MjModel,
@@ -80,7 +80,7 @@ class DebugVisualizer(ABC):
     alpha: float = 0.5,
     label: str | None = None,
   ) -> None:
-    """Add a ghost/transparent rendering of a robot at a target pose.
+    """Add a ghost/transparent rendering of an entity at a target pose via FK.
 
     Args:
       qpos: Joint positions for the ghost pose.
@@ -89,6 +89,29 @@ class DebugVisualizer(ABC):
       mocap_quat: Optional mocap quaternion(s) for fixed-base entities.
       alpha: Transparency override (0=transparent, 1=opaque). May not be supported by
         all implementations.
+      label: Optional label for this ghost.
+    """
+    ...
+
+  @abstractmethod
+  def add_ghost_bodies(
+    self,
+    model: mujoco.MjModel,
+    body_ids: np.ndarray,
+    body_xpos: np.ndarray,
+    body_xquat: np.ndarray,
+    label: str | None = None,
+  ) -> None:
+    """Add a ghost rendering of specific bodies at given world-frame poses.
+
+    Only geoms belonging to the specified bodies are rendered. The model should
+    have non-tracked body geoms hidden (geom_rgba alpha=0) if using native viewer.
+
+    Args:
+      model: MuJoCo model with pre-configured appearance (geom_rgba for colors).
+      body_ids: MuJoCo body IDs to render. Shape: (B,).
+      body_xpos: World-frame positions for each body. Shape: (B, 3).
+      body_xquat: World-frame quaternions (wxyz) for each body. Shape: (B, 4).
       label: Optional label for this ghost.
     """
     ...
@@ -229,16 +252,12 @@ class NullDebugVisualizer:
   def add_arrow(self, start, end, color, width=0.015, label=None) -> None:
     pass
 
-  def add_ghost_mesh(
-    self,
-    qpos,
-    model,
-    mocap_pos=None,
-    mocap_quat=None,
-    alpha=0.5,
-    label=None,
+  def add_ghost_entity(self, qpos, model, alpha=0.5, label=None) -> None:
+    pass
+
+  def add_ghost_bodies(
+    self, model, body_ids, body_xpos, body_xquat, label=None
   ) -> None:
-    del mocap_pos, mocap_quat
     pass
 
   def add_frame(
