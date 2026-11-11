@@ -10,7 +10,8 @@ import torch
 from mjlab.asset_zoo.robots.unitree_g1.g1_constants import G1_XML
 from mjlab.utils.forward_kinematics import ForwardKinematics
 
-# Several hinges in one body, welded bodies, a deep chain and a body in a frame.
+# Several hinges in one body, slides next to hinges, welded bodies, a deep chain and
+# a body in a frame.
 _STRESS_XML = """
 <mujoco>
   <default><geom type="sphere" size="0.03" mass="0.1"/></default>
@@ -37,12 +38,13 @@ _STRESS_XML = """
           <geom/>
           <body name="branch2" pos="0 0.2 0">
             <joint name="b3" axis="0.3 0.3 0.9" range="-1.5 1.5"/>
+            <joint name="b4" type="slide" axis="0.2 1 0.1" range="-0.3 0.3"/>
             <geom/>
           </body>
         </body>
       </body>
       <body name="c1" pos="0 0 -0.1"><joint axis="0 1 0" range="-1 1"/><geom/>
-      <body name="c2" pos="0 0 -0.1" euler="0 0.1 0"><joint axis="1 0 0" range="-1 1"/><geom/>
+      <body name="c2" pos="0 0 -0.1" euler="0 0.1 0"><joint type="slide" axis="0 0.3 1" range="-0.2 0.2"/><joint axis="1 0 0" range="-1 1"/><geom/>
       <body name="c3" pos="0.02 0 -0.1"><geom/>
       <body name="c4" pos="0 0 -0.1" euler="0 0 0.5"><joint axis="1 1 0" range="-1 1"/><geom/>
       <body name="c5" pos="0 0 -0.1"><joint axis="0 1 0" range="-1 1"/><joint axis="1 0 0" range="-1 1"/><geom/>
@@ -68,8 +70,8 @@ _STRESS_XML = """
 )
 def test_matches_mujoco(load) -> None:
   model = load()
-  hinge = mujoco.mjtJoint.mjJNT_HINGE
-  joints = [j for j in range(model.njnt) if model.jnt_type[j] == hinge]
+  free = mujoco.mjtJoint.mjJNT_FREE
+  joints = [j for j in range(model.njnt) if model.jnt_type[j] != free]
   q_adr, v_adr = model.jnt_qposadr[joints], model.jnt_dofadr[joints]
   rng = np.random.default_rng(0)
   model.jnt_pos[joints] = rng.normal(size=(len(joints), 3)) * 0.05

@@ -3,12 +3,12 @@ bodies from its root and joint state, differentiable, in the convention of mjlab
 ``body_link_pose_w`` and ``body_link_vel_w``.
 
 Each body follows MuJoCo's kinematics: the parent frame, then the body's fixed
-offset, then each of its hinges, turning ``qpos - qpos0`` about the hinge axis
-through the hinge anchor. Every hinge, and every body without one, is a step.
-Each returned body composes the steps on its path from the root, root first, and
-sums their hinge twists, taken at the root origin; the root pose and twist apply
-last. The pass runs on per-component ``(..., R)`` tensors, which a compiler fuses
-into few kernels.
+offset, then each of its joints: a hinge turns ``qpos - qpos0`` about its axis
+through its anchor, a slide moves ``qpos - qpos0`` along its axis. Every joint,
+and every body without one, is a step. Each returned body composes the steps on
+its path from the root, root first, and sums their joint twists, taken at the
+root origin; the root pose and twist apply last. The pass runs on per-component
+``(..., R)`` tensors, which a compiler fuses into few kernels.
 """
 
 from __future__ import annotations
@@ -49,11 +49,12 @@ class ForwardKinematics:
     order = sorted(tree)  # MuJoCo numbers parents before children
 
     free, hinge = mujoco.mjtJoint.mjJNT_FREE, mujoco.mjtJoint.mjJNT_HINGE
+    slide = mujoco.mjtJoint.mjJNT_SLIDE
     zero, identity = np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])
-    # (parent, joint column, qpos0, axis, anchor, offset pos, offset quat); a step
-    # without a hinge reads column J, a zero pad after the J joints. Step 0, the
-    # root, is the identity.
-    fixed = (len(col_of), 0.0, zero, zero)
+    # (parent, joint column, qpos0, slides, axis, anchor, offset pos, offset quat);
+    # a step without a joint reads column J, a zero pad after the J joints. Step 0,
+    # the root, is the identity.
+    fixed = (len(col_of), 0.0, False, zero, zero)
     steps: list[tuple] = [(0, *fixed, zero, identity)]
     step_of = {order[0]: 0}
     for body in order:
@@ -61,21 +62,28 @@ class ForwardKinematics:
       joints = range(first, first + int(mj_model.body_jntnum[body]))
       kinds = [mj_model.jnt_type[j] for j in joints]
       root = body == int(body_ids[0])
-      if (parent == 0) != root or kinds != ([free] if root else [hinge] * len(kinds)):
+      below = all(k == hinge or k == slide for k in kinds)
+      if (parent == 0) != root or not (kinds == [free] if root else below):
         raise ValueError(
           f"body {mj_model.body(body).name}: needs the entity's first body as its "
-          "free-joint root under the world, with only hinges below it"
+          "free-joint root under the world, with only hinges and slides below it"
         )
       if root:
         continue
       adrs = [int(mj_model.jnt_qposadr[j]) for j in joints]
-      hinges = [
-        (col_of[a], mj_model.qpos0[a], mj_model.jnt_axis[j], mj_model.jnt_pos[j])
+      moving = [
+        (
+          col_of[a],
+          mj_model.qpos0[a],
+          mj_model.jnt_type[j] == slide,
+          mj_model.jnt_axis[j],
+          mj_model.jnt_pos[j],
+        )
         for j, a in zip(joints, adrs, strict=True)
       ]
       step = step_of[parent]
       offset = mj_model.body_pos[body], mj_model.body_quat[body]
-      for joint in hinges or [fixed]:
+      for joint in moving or [fixed]:
         steps.append((step, *joint, *offset))
         step, offset = len(steps) - 1, (zero, identity)
       step_of[body] = step
@@ -91,13 +99,14 @@ class ForwardKinematics:
       paths.append(path[::-1])
     depth = max(map(len, paths))
     paths = [[0] * (depth - len(path)) + path for path in paths]
-    # Per path step, with o its offset quaternion: the hinge anchor and axis in the
+    # Per path step, with o its offset quaternion: the joint anchor and axis in the
     # parent frame, the anchor in the step frame, o, and o * (0, axis); the step's
-    # quaternion is cos(h) o + sin(h) o * (0, axis) for h = (qpos - qpos0) / 2.
+    # quaternion is cos(h) o + sin(h) o * (0, axis) for h = (qpos - qpos0) / 2, and
+    # h = 0 for a slide.
     consts = np.zeros((depth, len(rows), 17))
     for r, path in enumerate(paths):
       for d, step in enumerate(path):
-        _, _, _, axis, anchor, offset_pos, offset_quat = steps[step]
+        _, _, _, _, axis, anchor, offset_pos, offset_quat = steps[step]
         parent_anchor, parent_axis, turned = np.zeros(3), np.zeros(3), np.zeros(4)
         mujoco.mju_rotVecQuat(parent_anchor, anchor, offset_quat)
         mujoco.mju_rotVecQuat(parent_axis, axis, offset_quat)
@@ -110,6 +119,9 @@ class ForwardKinematics:
     self.col = torch.tensor([[s[1] for s in d] for d in by_step], device=device)
     self.qpos0 = torch.tensor(
       [[s[2] for s in d] for d in by_step], device=device, dtype=dtype
+    )
+    self.slide = torch.tensor(
+      [[s[3] for s in d] for d in by_step], device=device, dtype=dtype
     )
     names = {
       int(adr): mj_model.joint(j).name.split("/")[-1]
@@ -137,19 +149,26 @@ class ForwardKinematics:
     quat: Vec = (one, zero, zero, zero)
     lin: Vec = (zero, zero, zero)
     ang: Vec = (zero, zero, zero)
-    for col, qpos0, consts in zip(self.col, self.qpos0, self.consts, strict=True):
+    for col, qpos0, slide, consts in zip(
+      self.col, self.qpos0, self.slide, self.consts, strict=True
+    ):
       c = consts.unbind(-1)
-      half = (joint_pos[..., col] - qpos0) / 2
-      # The hinge anchor and twist in the root frame, from the parent's pose.
+      move, rate = joint_pos[..., col] - qpos0, joint_vel[..., col]
+      half = move * (1 - slide) / 2
+      # The joint anchor and axis in the root frame, from the parent's pose; a hinge
+      # turns about the axis through the anchor, a slide moves along the axis.
       anchor = _add(pos, _rotate(quat, c[:3]))
-      twist = tuple(a * joint_vel[..., col] for a in _rotate(quat, c[3:6]))
+      axis = _rotate(quat, c[3:6])
+      twist = tuple(a * rate * (1 - slide) for a in axis)
       turn = tuple(
         half.cos() * o + half.sin() * t for o, t in zip(c[9:13], c[13:], strict=True)
       )
       quat = _mul(quat, turn)
       pos = _sub(anchor, _rotate(quat, c[6:9]))
+      pos = _add(pos, tuple(a * move * slide for a in axis))
       ang = _add(ang, twist)
       lin = _add(lin, _cross(anchor, twist))
+      lin = _add(lin, tuple(a * rate * slide for a in axis))
 
     w, x, y, z = root_quat.unsqueeze(-2).unbind(-1)
     norm = (w * w + x * x + y * y + z * z).sqrt()
