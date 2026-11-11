@@ -147,10 +147,15 @@ class MotionCommand(CommandTerm):
       device=self.device,
     )
 
+    # The robot's joints the motions hold, in the robot's order.
+    self.joint_ids = torch.tensor(
+      self.robot.find_joints(cfg.joint_names)[0], dtype=torch.long, device=self.device
+    )
+
     fk = ForwardKinematics(
       env.sim.mj_model,
       self.robot.indexing.body_ids,
-      self.robot.indexing.joint_q_adr,
+      self.robot.indexing.joint_q_adr[self.joint_ids],
       self.body_indexes,
       device=self.device,
     )
@@ -264,11 +269,11 @@ class MotionCommand(CommandTerm):
 
   @property
   def robot_joint_pos(self) -> torch.Tensor:
-    return self.robot.data.joint_pos
+    return self.robot.data.joint_pos[:, self.joint_ids]
 
   @property
   def robot_joint_vel(self) -> torch.Tensor:
-    return self.robot.data.joint_vel
+    return self.robot.data.joint_vel[:, self.joint_ids]
 
   @property
   def robot_body_pos_w(self) -> torch.Tensor:
@@ -428,13 +433,25 @@ class MotionCommand(CommandTerm):
     joint_vel: torch.Tensor,
   ) -> None:
     """Clip joint positions and write root + joint state to sim."""
-    soft_limits = self.robot.data.soft_joint_pos_limits[env_ids]
+    soft_limits = self.robot.data.soft_joint_pos_limits[env_ids][:, self.joint_ids]
     joint_pos = torch.clip(joint_pos, soft_limits[:, :, 0], soft_limits[:, :, 1])
+    joint_pos, joint_vel = self.full_joint_state(joint_pos, joint_vel)
     self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
 
     root_state = torch.cat([root_pos, root_ori, root_lin_vel, root_ang_vel], dim=-1)
     self.robot.write_root_state_to_sim(root_state, env_ids=env_ids)
     self.robot.reset(env_ids=env_ids)
+
+  def full_joint_state(
+    self, joint_pos: torch.Tensor, joint_vel: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Positions and velocities of all the robot's joints, from those of the joints
+    the motions hold. The other joints are at zero; a robot whose other joints
+    follow from these overrides this."""
+    shape = (*joint_pos.shape[:-1], self.robot.num_joints)
+    pos, vel = joint_pos.new_zeros(shape), joint_vel.new_zeros(shape)
+    pos[..., self.joint_ids], vel[..., self.joint_ids] = joint_pos, joint_vel
+    return pos, vel
 
   def _resample_command(self, env_ids: torch.Tensor):
     if self.cfg.sampling_mode == "start":
@@ -607,7 +624,10 @@ class MotionCommand(CommandTerm):
         qpos = np.zeros(self._env.sim.mj_model.nq)
         qpos[free_joint_q_adr[0:3]] = root_pos.cpu().numpy()
         qpos[free_joint_q_adr[3:7]] = self.motion.root_quat_w[frame].cpu().numpy()
-        qpos[joint_q_adr] = self.joint_pos[batch].cpu().numpy()
+        joint_pos, _ = self.full_joint_state(
+          self.joint_pos[batch], self.joint_vel[batch]
+        )
+        qpos[joint_q_adr] = joint_pos.cpu().numpy()
 
         visualizer.add_ghost_entity(
           qpos,
@@ -747,6 +767,8 @@ class MotionCommandCfg(CommandTermCfg):
   anchor_body_name: str
   body_names: tuple[str, ...]
   entity_name: str
+  joint_names: tuple[str, ...] = (".*",)
+  """The robot's joints the motion files hold."""
   pose_range: dict[str, tuple[float, float]] = field(default_factory=dict)
   velocity_range: dict[str, tuple[float, float]] = field(default_factory=dict)
   joint_position_range: tuple[float, float] = (-0.52, 0.52)

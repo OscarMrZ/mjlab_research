@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import mujoco
 import numpy as np
 import pytest
@@ -9,6 +11,7 @@ import torch
 
 from mjlab.asset_zoo.robots.unitree_g1.g1_constants import G1_XML
 from mjlab.tasks.tracking.mdp.commands import (
+  MotionCommand,
   MotionLoader,
   _resolve_motion_file,
 )
@@ -142,3 +145,16 @@ def test_loader_rejects_other_joints(create_motion_file, fk):
   np.savez(path, **data)
   with pytest.raises(ValueError, match="robot's"):
     MotionLoader(path, fk)
+
+
+def test_full_joint_state_spreads_the_motion_joints():
+  """The joints the motions hold land on their robot columns, the others at zero."""
+  command = SimpleNamespace(
+    joint_ids=torch.tensor([0, 2, 3]), robot=SimpleNamespace(num_joints=5)
+  )
+  joint_pos, joint_vel = torch.rand(2, 4, 3) + 1.0
+  pos, vel = MotionCommand.full_joint_state(command, joint_pos, joint_vel)  # type: ignore[arg-type]
+  assert pos.shape == vel.shape == (4, 5)
+  assert torch.equal(pos[:, [0, 2, 3]], joint_pos)
+  assert torch.equal(vel[:, [0, 2, 3]], joint_vel)
+  assert not pos[:, [1, 4]].any() and not vel[:, [1, 4]].any()
