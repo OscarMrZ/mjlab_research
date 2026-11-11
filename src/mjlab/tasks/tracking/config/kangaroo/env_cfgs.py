@@ -9,6 +9,7 @@ from mjlab.asset_zoo.robots import (
   get_kangaroo_grippers_robot_cfg,
 )
 from mjlab.asset_zoo.robots.pal_kangaroo.kangaroo_constants import (
+  KANGAROO_GRIPPERS_ACTUATORS,
   kangaroo_passive_leg_joints,
 )
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
@@ -19,41 +20,26 @@ from mjlab.tasks.tracking.tracking_env_cfg import make_tracking_env_cfg
 
 
 class KangarooMotionCommand(MotionCommand):
-  """A motion command that keeps the passive knee linkage closed at a reset."""
+  """A motion command for motions that hold the actuated joints only."""
 
-  def _write_reference_state_to_sim(
-    self,
-    env_ids: torch.Tensor,
-    root_pos: torch.Tensor,
-    root_ori: torch.Tensor,
-    root_lin_vel: torch.Tensor,
-    root_ang_vel: torch.Tensor,
-    joint_pos: torch.Tensor,
-    joint_vel: torch.Tensor,
-  ) -> None:
-    """Write the reference state with the femur and knee joints set from the leg
-    length.
+  def full_joint_state(
+    self, joint_pos: torch.Tensor, joint_vel: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Set the passive femur and knee joints from the leg length.
 
-    The base class perturbs and clips every joint on its own, which would open the
-    linkage and leave the equality constraint to snap it shut. Here the linkage
-    follows the clipped leg length, and is not clipped itself.
+    Left at zero they would open the knee linkage, and a reset would leave the
+    equality constraint to snap it shut.
     """
-    soft_limits = self.robot.data.soft_joint_pos_limits[env_ids]
-    joint_pos = torch.clip(joint_pos, soft_limits[:, :, 0], soft_limits[:, :, 1])
-    joint_vel = joint_vel.clone()
+    pos, vel = super().full_joint_state(joint_pos, joint_vel)
     names = self.robot.joint_names
     passive = kangaroo_passive_leg_joints(
-      dict(zip(names, joint_pos.unbind(-1), strict=True)),
-      dict(zip(names, joint_vel.unbind(-1), strict=True)),
+      dict(zip(names, pos.unbind(-1), strict=True)),
+      dict(zip(names, vel.unbind(-1), strict=True)),
     )
-    for name, (pos, vel) in passive.items():
-      joint_pos[:, names.index(name)] = pos
-      joint_vel[:, names.index(name)] = vel
-    self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
-
-    root_state = torch.cat([root_pos, root_ori, root_lin_vel, root_ang_vel], dim=-1)
-    self.robot.write_root_state_to_sim(root_state, env_ids=env_ids)
-    self.robot.reset(env_ids=env_ids)
+    for name, (passive_pos, passive_vel) in passive.items():
+      pos[..., names.index(name)] = passive_pos
+      vel[..., names.index(name)] = passive_vel
+    return pos, vel
 
 
 @dataclass(kw_only=True)
@@ -91,6 +77,10 @@ def pal_kangaroo_grippers_flat_tracking_env_cfg(
     **{f.name: getattr(base_cmd, f.name) for f in fields(base_cmd)}
   )
   cfg.commands["motion"] = motion_cmd
+  # The motions hold the actuated joints: the femur and knee joints are passive.
+  motion_cmd.joint_names = tuple(
+    name for a in KANGAROO_GRIPPERS_ACTUATORS for name in a.target_names_expr
+  )
   motion_cmd.anchor_body_name = "pelvis_2_link"
   # The G1's tracked bodies mapped to Kangaroo. The G1 knee has no counterpart:
   # the leg is a hip-ankle slide.

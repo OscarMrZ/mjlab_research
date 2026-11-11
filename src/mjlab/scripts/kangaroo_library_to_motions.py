@@ -4,9 +4,8 @@ The library is a folder with ``clips.json`` (``fps``, ``joint_names`` and the
 clips' ``name``, ``start`` and ``length``), ``qpos.npy`` and ``qvel.npy``: one row
 per frame in MuJoCo's free-joint layout, with the actuated joints only. The packed
 directory is the one ``pack_motions`` writes and ``MotionLoader`` reads. The frames
-are kept as they are, with two changes: the root angular velocity goes from the
-root frame to the world frame, and the passive femur and knee joints are added,
-computed from the leg length.
+are kept as they are, with one change: the root angular velocity goes from the
+root frame to the world frame.
 
 Example:
   uv run python -m mjlab.scripts.kangaroo_library_to_motions \
@@ -19,14 +18,10 @@ import argparse
 import json
 import os
 
-import mujoco
 import numpy as np
 import torch
 
-from mjlab.asset_zoo.robots.pal_kangaroo.kangaroo_constants import (
-  get_spec,
-  kangaroo_passive_leg_joints,
-)
+from mjlab.asset_zoo.robots.pal_kangaroo.kangaroo_constants import get_spec
 from mjlab.utils.lab_api.math import quat_apply
 
 
@@ -50,12 +45,10 @@ def main() -> None:
 
   joint_pos = dict(zip(meta["joint_names"], qpos[:, 7:].unbind(-1), strict=True))
   joint_vel = dict(zip(meta["joint_names"], qvel[:, 6:].unbind(-1), strict=True))
-  for name, (pos, vel) in kangaroo_passive_leg_joints(joint_pos, joint_vel).items():
-    joint_pos[name], joint_vel[name] = pos, vel
-  free = mujoco.mjtJoint.mjJNT_FREE
-  joint_names = [joint.name for joint in get_spec().joints if joint.type != free]
-  if set(joint_names) != set(joint_pos):
-    raise SystemExit("[convert] the library's joints are not the robot's")
+  # The library's joints, in the robot's order.
+  joint_names = [joint.name for joint in get_spec().joints if joint.name in joint_pos]
+  if len(joint_names) != len(joint_pos):
+    raise SystemExit("[convert] the library has joints the robot does not")
 
   fields = {
     "joint_pos": torch.stack([joint_pos[name] for name in joint_names], dim=-1),
