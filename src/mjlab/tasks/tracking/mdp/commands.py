@@ -455,7 +455,10 @@ class MotionCommand(CommandTerm):
 
   def _resample_command(self, env_ids: torch.Tensor):
     if self.cfg.sampling_mode == "start":
-      frames = torch.zeros_like(env_ids)
+      # The first frame of a random clip: frame 0 when there is one motion.
+      ends = self.motion.motion_ends
+      clips = torch.randint(len(ends), env_ids.shape, device=self.device)
+      frames = torch.where(clips > 0, ends[clips - 1], 0)
     elif self.cfg.sampling_mode == "uniform":
       frames = self._uniform_sampling(env_ids)
     elif self.cfg.sampling_mode == "external":
