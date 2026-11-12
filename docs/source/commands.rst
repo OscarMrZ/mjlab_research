@@ -75,7 +75,7 @@ Each task ships with its own command terms tailored to its objective.
    * - ``MotionCommand``
      - Streams reference joint positions, velocities, and body poses
        from a pre-recorded ``.npz`` motion clip. Supports three
-       start-frame sampling modes: ``"start"`` (always frame 0),
+       start-frame sampling modes: ``"start"`` (first frame of a random clip),
        ``"uniform"`` (random), and ``"adaptive"`` (biased toward
        difficult regions). At reset the robot is initialized from the
        sampled frame with optional perturbations. Used by the tracking
