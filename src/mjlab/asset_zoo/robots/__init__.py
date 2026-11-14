@@ -5,10 +5,16 @@ from mjlab.asset_zoo.robots.i2rt_yam.yam_constants import (
   get_yam_robot_cfg as get_yam_robot_cfg,
 )
 from mjlab.asset_zoo.robots.pal_kangaroo.kangaroo_constants import (
+  KANGAROO_ACTION_SCALE as KANGAROO_ACTION_SCALE,
+)
+from mjlab.asset_zoo.robots.pal_kangaroo.kangaroo_constants import (
   KANGAROO_GRIPPERS_ACTION_SCALE as KANGAROO_GRIPPERS_ACTION_SCALE,
 )
 from mjlab.asset_zoo.robots.pal_kangaroo.kangaroo_constants import (
   get_kangaroo_grippers_robot_cfg as get_kangaroo_grippers_robot_cfg,
+)
+from mjlab.asset_zoo.robots.pal_kangaroo.kangaroo_constants import (
+  get_kangaroo_robot_cfg as get_kangaroo_robot_cfg,
 )
 from mjlab.asset_zoo.robots.unitree_g1.g1_constants import (
   G1_ACTION_SCALE as G1_ACTION_SCALE,
