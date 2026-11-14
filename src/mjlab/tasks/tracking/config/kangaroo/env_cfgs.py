@@ -1,14 +1,17 @@
-"""PAL Kangaroo grippers flat tracking environment configurations."""
+"""PAL Kangaroo flat tracking environment configurations."""
 
 from dataclasses import dataclass, fields
 
 import torch
 
 from mjlab.asset_zoo.robots import (
+  KANGAROO_ACTION_SCALE,
   KANGAROO_GRIPPERS_ACTION_SCALE,
   get_kangaroo_grippers_robot_cfg,
+  get_kangaroo_robot_cfg,
 )
 from mjlab.asset_zoo.robots.pal_kangaroo.kangaroo_constants import (
+  KANGAROO_ACTUATORS,
   KANGAROO_GRIPPERS_ACTUATORS,
   kangaroo_passive_leg_joints,
 )
@@ -48,13 +51,13 @@ class KangarooMotionCommandCfg(MotionCommandCfg):
     return KangarooMotionCommand(self, env)
 
 
-def pal_kangaroo_grippers_flat_tracking_env_cfg(
+def pal_kangaroo_flat_tracking_env_cfg(
   play: bool = False,
 ) -> ManagerBasedRlEnvCfg:
-  """Create PAL Kangaroo grippers flat terrain tracking configuration."""
+  """Create PAL Kangaroo (4-DoF arms) flat terrain tracking configuration."""
   cfg = make_tracking_env_cfg()
 
-  cfg.scene.entities = {"robot": get_kangaroo_grippers_robot_cfg()}
+  cfg.scene.entities = {"robot": get_kangaroo_robot_cfg()}
 
   self_collision_cfg = ContactSensorCfg(
     name="self_collision",
@@ -69,7 +72,7 @@ def pal_kangaroo_grippers_flat_tracking_env_cfg(
 
   joint_pos_action = cfg.actions["joint_pos"]
   assert isinstance(joint_pos_action, JointPositionActionCfg)
-  joint_pos_action.scale = KANGAROO_GRIPPERS_ACTION_SCALE
+  joint_pos_action.scale = KANGAROO_ACTION_SCALE
 
   base_cmd = cfg.commands["motion"]
   assert isinstance(base_cmd, MotionCommandCfg)
@@ -79,11 +82,11 @@ def pal_kangaroo_grippers_flat_tracking_env_cfg(
   cfg.commands["motion"] = motion_cmd
   # The motions hold the actuated joints: the femur and knee joints are passive.
   motion_cmd.joint_names = tuple(
-    name for a in KANGAROO_GRIPPERS_ACTUATORS for name in a.target_names_expr
+    name for a in KANGAROO_ACTUATORS for name in a.target_names_expr
   )
   motion_cmd.anchor_body_name = "pelvis_2_link"
   # The G1's tracked bodies mapped to Kangaroo. The G1 knee has no counterpart:
-  # the leg is a hip-ankle slide.
+  # the leg is a hip-ankle slide. The hand is the tip of the rigid forearm.
   motion_cmd.body_names = (
     "base_link",
     "pelvis_2_link",
@@ -93,10 +96,10 @@ def pal_kangaroo_grippers_flat_tracking_env_cfg(
     "leg_right_5_link",
     "arm_left_2_link",
     "arm_left_4_link",
-    "arm_left_7_link",
+    "arm_left_tip_link",
     "arm_right_2_link",
     "arm_right_4_link",
-    "arm_right_7_link",
+    "arm_right_tip_link",
   )
 
   cfg.events["foot_friction"].params[
@@ -107,8 +110,8 @@ def pal_kangaroo_grippers_flat_tracking_env_cfg(
   cfg.terminations["ee_body_pos"].params["body_names"] = (
     "leg_left_5_link",
     "leg_right_5_link",
-    "arm_left_7_link",
-    "arm_right_7_link",
+    "arm_left_tip_link",
+    "arm_right_tip_link",
   )
 
   cfg.viewer.body_name = "pelvis_2_link"
@@ -130,5 +133,36 @@ def pal_kangaroo_grippers_flat_tracking_env_cfg(
     motion_cmd.velocity_range = {}
 
     motion_cmd.sampling_mode = "start"
+
+  return cfg
+
+
+def pal_kangaroo_grippers_flat_tracking_env_cfg(
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Create PAL Kangaroo grippers flat terrain tracking configuration.
+
+  The 4-DoF configuration with the 7-DoF arms: their wrist is the hand.
+  """
+  cfg = pal_kangaroo_flat_tracking_env_cfg(play=play)
+
+  cfg.scene.entities = {"robot": get_kangaroo_grippers_robot_cfg()}
+
+  joint_pos_action = cfg.actions["joint_pos"]
+  assert isinstance(joint_pos_action, JointPositionActionCfg)
+  joint_pos_action.scale = KANGAROO_GRIPPERS_ACTION_SCALE
+
+  motion_cmd = cfg.commands["motion"]
+  assert isinstance(motion_cmd, KangarooMotionCommandCfg)
+  motion_cmd.joint_names = tuple(
+    name for a in KANGAROO_GRIPPERS_ACTUATORS for name in a.target_names_expr
+  )
+  hand = {
+    "arm_left_tip_link": "arm_left_7_link",
+    "arm_right_tip_link": "arm_right_7_link",
+  }
+  motion_cmd.body_names = tuple(hand.get(b, b) for b in motion_cmd.body_names)
+  ee_body_pos = cfg.terminations["ee_body_pos"].params
+  ee_body_pos["body_names"] = tuple(hand.get(b, b) for b in ee_body_pos["body_names"])
 
   return cfg
