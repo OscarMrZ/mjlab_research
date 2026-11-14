@@ -1,4 +1,5 @@
-"""PAL Kangaroo constants: the model with 7-DoF arms and grippers.
+"""PAL Kangaroo constants: the model with 4-DoF arms and a rigid forearm, and the
+one with 7-DoF arms and grippers.
 
 A leg is a hip-ankle slide (``leg_*_length_joint``) with a passive knee linkage
 closed on it by an equality constraint (``leg_*_femur_joint``,
@@ -20,6 +21,11 @@ from mjlab.utils.spec_config import CollisionCfg
 # MJCF and assets.
 ##
 
+KANGAROO_XML: Path = (
+  MJLAB_SRC_PATH / "asset_zoo" / "robots" / "pal_kangaroo" / "xmls" / "kangaroo.xml"
+)
+assert KANGAROO_XML.exists()
+
 KANGAROO_GRIPPERS_XML: Path = (
   MJLAB_SRC_PATH
   / "asset_zoo"
@@ -31,7 +37,11 @@ KANGAROO_GRIPPERS_XML: Path = (
 assert KANGAROO_GRIPPERS_XML.exists()
 
 
-def get_spec() -> mujoco.MjSpec:
+def get_kangaroo_spec() -> mujoco.MjSpec:
+  return mujoco.MjSpec.from_file(str(KANGAROO_XML))
+
+
+def get_kangaroo_grippers_spec() -> mujoco.MjSpec:
   return mujoco.MjSpec.from_file(str(KANGAROO_GRIPPERS_XML))
 
 
@@ -68,7 +78,7 @@ ARMATURE_S_PLUS = 3.3e-05 * 121**2
 ARMATURE_S_MINUS = 2.99e-05 * 101**2
 ARMATURE_XS = 1.99e-05 * 101**2
 
-KANGAROO_GRIPPERS_ACTUATORS = (
+KANGAROO_ACTUATORS = (
   _actuator(("leg_.*_1_joint",), 80.0, 0.25, 0.9, 1.65),
   _actuator(("leg_.*_2_joint",), 230.0, 0.5, 4.0, 6.49),
   _actuator(("leg_.*_3_joint",), 139.0, 0.2, 2.34, 2.705),
@@ -83,6 +93,9 @@ KANGAROO_GRIPPERS_ACTUATORS = (
     ARMATURE_S_PLUS,
   ),
   _actuator((r"arm_.*_(?![1267]_joint)\d+_joint",), 25.0, ARMATURE_S_MINUS),
+)
+# The grippers model adds the wrist: arm joints 6 and 7.
+KANGAROO_GRIPPERS_ACTUATORS = KANGAROO_ACTUATORS + (
   _actuator((r"arm_.*_(?![12345]_joint)\d+_joint",), 25.0, ARMATURE_XS),
 )
 
@@ -136,10 +149,25 @@ FULL_COLLISION = CollisionCfg(
 # Final config.
 ##
 
+KANGAROO_ARTICULATION = EntityArticulationInfoCfg(
+  actuators=KANGAROO_ACTUATORS,
+  soft_joint_pos_limit_factor=0.9,
+)
+
 KANGAROO_GRIPPERS_ARTICULATION = EntityArticulationInfoCfg(
   actuators=KANGAROO_GRIPPERS_ACTUATORS,
   soft_joint_pos_limit_factor=0.9,
 )
+
+
+def get_kangaroo_robot_cfg() -> EntityCfg:
+  """Get a fresh Kangaroo (4-DoF arms) robot configuration instance."""
+  return EntityCfg(
+    init_state=INIT_STATE,
+    collisions=(FULL_COLLISION,),
+    spec_fn=get_kangaroo_spec,
+    articulation=KANGAROO_ARTICULATION,
+  )
 
 
 def get_kangaroo_grippers_robot_cfg() -> EntityCfg:
@@ -147,7 +175,7 @@ def get_kangaroo_grippers_robot_cfg() -> EntityCfg:
   return EntityCfg(
     init_state=INIT_STATE,
     collisions=(FULL_COLLISION,),
-    spec_fn=get_spec,
+    spec_fn=get_kangaroo_grippers_spec,
     articulation=KANGAROO_GRIPPERS_ARTICULATION,
   )
 
@@ -157,16 +185,23 @@ def get_kangaroo_grippers_robot_cfg() -> EntityCfg:
 # exploration per unit of action noise, and too high an action-rate cost per radian.
 ARM_WAIST_ACTION_SCALE_FREQ_HZ = 1.0
 
-KANGAROO_GRIPPERS_ACTION_SCALE: dict[str, float] = {}
-for a in KANGAROO_GRIPPERS_ARTICULATION.actuators:
-  assert isinstance(a, BuiltinPositionActuatorCfg)
-  e = a.effort_limit
-  s = a.stiffness
-  assert e is not None and a.armature is not None
-  for n in a.target_names_expr:
-    if not n.startswith("leg_"):
-      s = a.armature * (2.0 * math.pi * ARM_WAIST_ACTION_SCALE_FREQ_HZ) ** 2
-    KANGAROO_GRIPPERS_ACTION_SCALE[n] = 0.25 * e / s
+
+def _action_scale(articulation: EntityArticulationInfoCfg) -> dict[str, float]:
+  scale: dict[str, float] = {}
+  for a in articulation.actuators:
+    assert isinstance(a, BuiltinPositionActuatorCfg)
+    e = a.effort_limit
+    s = a.stiffness
+    assert e is not None and a.armature is not None
+    for n in a.target_names_expr:
+      if not n.startswith("leg_"):
+        s = a.armature * (2.0 * math.pi * ARM_WAIST_ACTION_SCALE_FREQ_HZ) ** 2
+      scale[n] = 0.25 * e / s
+  return scale
+
+
+KANGAROO_ACTION_SCALE = _action_scale(KANGAROO_ARTICULATION)
+KANGAROO_GRIPPERS_ACTION_SCALE = _action_scale(KANGAROO_GRIPPERS_ARTICULATION)
 
 ##
 # Closed-chain leg.
@@ -208,6 +243,6 @@ if __name__ == "__main__":
 
   from mjlab.entity.entity import Entity
 
-  robot = Entity(get_kangaroo_grippers_robot_cfg())
+  robot = Entity(get_kangaroo_robot_cfg())
 
   viewer.launch(robot.spec.compile())

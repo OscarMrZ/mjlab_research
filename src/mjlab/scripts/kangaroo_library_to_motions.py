@@ -21,7 +21,9 @@ import os
 import numpy as np
 import torch
 
-from mjlab.asset_zoo.robots.pal_kangaroo.kangaroo_constants import get_spec
+from mjlab.asset_zoo.robots.pal_kangaroo.kangaroo_constants import (
+  get_kangaroo_grippers_spec as get_spec,
+)
 from mjlab.utils.lab_api.math import quat_apply
 
 
