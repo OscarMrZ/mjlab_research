@@ -142,7 +142,9 @@ def pal_kangaroo_grippers_flat_tracking_env_cfg(
 ) -> ManagerBasedRlEnvCfg:
   """Create PAL Kangaroo grippers flat terrain tracking configuration.
 
-  The 4-DoF configuration with the 7-DoF arms: their wrist is the hand.
+  The 4-DoF configuration with the 7-DoF arms: their wrist is the hand. The link
+  before it is tracked too: the wrist has two joint solutions for one pose of the
+  hand, which that link tells apart.
   """
   cfg = pal_kangaroo_flat_tracking_env_cfg(play=play)
 
@@ -161,7 +163,10 @@ def pal_kangaroo_grippers_flat_tracking_env_cfg(
     "arm_left_tip_link": "arm_left_7_link",
     "arm_right_tip_link": "arm_right_7_link",
   }
-  motion_cmd.body_names = tuple(hand.get(b, b) for b in motion_cmd.body_names)
+  motion_cmd.body_names = tuple(hand.get(b, b) for b in motion_cmd.body_names) + (
+    "arm_left_6_link",
+    "arm_right_6_link",
+  )
   ee_body_pos = cfg.terminations["ee_body_pos"].params
   ee_body_pos["body_names"] = tuple(hand.get(b, b) for b in ee_body_pos["body_names"])
 
