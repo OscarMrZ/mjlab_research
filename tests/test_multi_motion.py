@@ -158,3 +158,56 @@ def test_full_joint_state_spreads_the_motion_joints():
   assert torch.equal(pos[:, [0, 2, 3]], joint_pos)
   assert torch.equal(vel[:, [0, 2, 3]], joint_vel)
   assert not pos[:, [1, 4]].any() and not vel[:, [1, 4]].any()
+
+
+# Held clips
+
+
+def _rest(path: str, frames: tuple[int, ...], lying: tuple[int, ...] = ()) -> None:
+  """Put ``frames`` of the motion file at rest, upright at standing height, and
+  those of ``lying`` on their side."""
+  clip = dict(np.load(path))
+  clip["root_pos_w"][:, 2] = 0.9
+  for frame in frames:
+    side = frame in lying
+    clip["root_quat_w"][frame] = [0.5**0.5, 0.5**0.5, 0, 0] if side else [1, 0, 0, 0]
+    for name in ("root_lin_vel_w", "root_ang_vel_w", "joint_vel"):
+      clip[name][frame] = 0.0
+  np.savez(path, **clip)
+
+
+def test_held_clips_hold_a_still_frame_without_velocity(create_motion_file, fk):
+  path = create_motion_file("motion", num_frames=20)
+  # Frames 3 and 11 are the only still, upright ones: 7 is still, but lying down.
+  _rest(path, frames=(3, 7, 11), lying=(7,))
+  motion = MotionLoader(path, fk)
+
+  loader = MotionLoader(path, fk, held_clips=16, held_steps=5)
+
+  assert loader.time_step_total == loader.joint_pos.shape[0] == 20 + 16 * 5
+  assert loader.held_starts.tolist() == list(range(20, 100, 5))
+  assert loader.motion_ends.tolist() == list(range(20, 105, 5))
+  assert len(loader.motion_names) == 17
+  held = zip(loader.held_starts.tolist(), loader.motion_names[1:], strict=True)
+  for start, name in held:
+    source = int(name.removeprefix("held_"))
+    assert source in (3, 11)
+    clip = slice(start, start + 5)
+    assert torch.equal(loader.root_pos_w[clip], motion.root_pos_w[source].expand(5, 3))
+    assert torch.equal(
+      loader.root_quat_w[clip], motion.root_quat_w[source].expand(5, 4)
+    )
+    assert torch.equal(loader.joint_pos[clip], motion.joint_pos[source].expand(5, -1))
+    assert not loader.root_lin_vel_w[clip].any()
+    assert not loader.root_ang_vel_w[clip].any()
+    assert not loader.joint_vel[clip].any()
+  # The motions themselves are as they were, and there are none held unless asked.
+  assert torch.equal(loader.joint_pos[:20], motion.joint_pos)
+  assert motion.held_starts.numel() == 0
+
+
+def test_held_clips_need_a_still_frame(create_motion_file, fk):
+  path = create_motion_file("motion", num_frames=20)
+
+  with pytest.raises(ValueError, match="no still, upright frame"):
+    MotionLoader(path, fk, held_clips=2, held_steps=5)

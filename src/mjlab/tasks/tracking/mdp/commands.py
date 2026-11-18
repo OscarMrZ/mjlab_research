@@ -49,6 +49,47 @@ def _resolve_motion_file(source: str | list[str]) -> list[str]:
   return [source]
 
 
+_TRACKS = (
+  "root_pos_w",
+  "root_quat_w",
+  "root_lin_vel_w",
+  "root_ang_vel_w",
+  "joint_pos",
+  "joint_vel",
+)
+
+
+def _held_frames(
+  tracks: dict[str, np.ndarray],
+  count: int,
+  min_height: float = 0.6,
+  max_tilt: float = 0.35,
+  seed: int = 0,
+) -> np.ndarray:
+  """``count`` frames of the motions that a standing robot can hold, drawn at random.
+
+  They have the base and every joint at rest, the base above ``min_height`` [m]
+  and within ``max_tilt`` [rad] of upright.
+  """
+  quat = tracks["root_quat_w"]
+  still = (
+    (np.linalg.norm(tracks["root_lin_vel_w"], axis=-1) < 0.05)
+    & (np.linalg.norm(tracks["root_ang_vel_w"], axis=-1) < 0.1)
+    & (tracks["root_pos_w"][:, 2] > min_height)
+    # The cosine of the tilt, from the wxyz quaternion.
+    & (1.0 - 2.0 * np.square(quat[:, 1:3]).sum(axis=-1) > math.cos(max_tilt))
+  )
+  # In chunks: the joint velocities are the largest track.
+  joint_vel = tracks["joint_vel"]
+  for start in range(0, len(joint_vel), 1 << 21):
+    chunk = slice(start, start + (1 << 21))
+    still[chunk] &= np.abs(joint_vel[chunk]).max(axis=-1) < 0.3
+  candidates = np.flatnonzero(still)
+  if candidates.size == 0:
+    raise ValueError("the motions have no still, upright frame to hold")
+  return np.random.default_rng(seed).choice(candidates, size=count)
+
+
 class MotionLoader:
   """Loads reference motion as concatenated per-frame tensors on ``device``: the
   root link's world pose and twist and the joint positions and velocities.
@@ -66,7 +107,12 @@ class MotionLoader:
   """
 
   def __init__(
-    self, motion_file: str | list[str], fk: ForwardKinematics, device: str = "cpu"
+    self,
+    motion_file: str | list[str],
+    fk: ForwardKinematics,
+    device: str = "cpu",
+    held_clips: int = 0,
+    held_steps: int = 250,
   ) -> None:
     files = _resolve_motion_file(motion_file)
 
@@ -101,18 +147,37 @@ class MotionLoader:
     def to_device(arr: np.ndarray) -> torch.Tensor:
       return torch.from_numpy(arr).to(device=device, dtype=torch.float32)
 
-    self.root_pos_w = to_device(field("root_pos_w"))
-    self.root_quat_w = to_device(field("root_quat_w"))
-    self.root_lin_vel_w = to_device(field("root_lin_vel_w"))
-    self.root_ang_vel_w = to_device(field("root_ang_vel_w"))
-    self.joint_pos = to_device(field("joint_pos"))
-    self.joint_vel = to_device(field("joint_vel"))
+    tracks = {name: field(name) for name in _TRACKS}
+    if names is None:
+      names = [f"clip_{i}" for i in range(len(motion_ends))]
+    held_starts = np.zeros(0, dtype=np.int64)
+    if held_clips > 0:
+      # On the CPU, so that the device holds the motions once.
+      picks = _held_frames(tracks, held_clips)
+      held_starts = len(tracks["joint_pos"]) + held_steps * np.arange(held_clips)
+      motion_ends = np.concatenate([motion_ends, held_starts + held_steps])
+      names = names + [f"held_{frame}" for frame in picks.tolist()]
+      frames = np.repeat(picks, held_steps)
+      for name, track in tracks.items():
+        held = track[frames]
+        if name not in ("root_pos_w", "root_quat_w", "joint_pos"):
+          held = np.zeros_like(held)  # A held pose has no velocity.
+        tracks[name] = np.concatenate([track, held])
+
+    self.root_pos_w = to_device(tracks.pop("root_pos_w"))
+    self.root_quat_w = to_device(tracks.pop("root_quat_w"))
+    self.root_lin_vel_w = to_device(tracks.pop("root_lin_vel_w"))
+    self.root_ang_vel_w = to_device(tracks.pop("root_ang_vel_w"))
+    self.joint_pos = to_device(tracks.pop("joint_pos"))
+    self.joint_vel = to_device(tracks.pop("joint_vel"))
     self.fk = fk
     self.time_step_total = self.joint_pos.shape[0]
     self.motion_ends = torch.as_tensor(motion_ends, dtype=torch.long, device=device)
-    if names is None:
-      names = [f"clip_{i}" for i in range(len(self.motion_ends))]
     self.motion_names: list[str] = names
+    self.held_starts = torch.as_tensor(held_starts, dtype=torch.long, device=device)
+    """The first frame of each held clip: ``held_clips`` clips after the motions,
+    each holding one still frame of them for ``held_steps`` frames, without
+    velocity. References that stay where they are."""
 
   def body_state(
     self, frames: torch.Tensor
@@ -159,7 +224,13 @@ class MotionCommand(CommandTerm):
       self.body_indexes,
       device=self.device,
     )
-    self.motion = MotionLoader(self.cfg.motion_file, fk, device=self.device)
+    self.motion = MotionLoader(
+      self.cfg.motion_file,
+      fk,
+      device=self.device,
+      held_clips=self.cfg.hold_clips if self.cfg.hold_fraction > 0.0 else 0,
+      held_steps=self.cfg.hold_steps,
+    )
     # One fused kernel per call; env subsets of two or more share one graph.
     self._body_state = torch.compile(
       self.motion.body_state,
@@ -466,6 +537,13 @@ class MotionCommand(CommandTerm):
     else:
       assert self.cfg.sampling_mode == "adaptive"
       frames = self._adaptive_sampling(env_ids)
+
+    if self.cfg.hold_fraction > 0.0:
+      # Some hold a still pose instead of following a motion.
+      starts = self.motion.held_starts
+      held = torch.rand(len(env_ids), device=self.device) < self.cfg.hold_fraction
+      clips = torch.randint(len(starts), env_ids.shape, device=self.device)
+      frames = torch.where(held, starts[clips], frames)
 
     on_last = torch.isin(frames, self.motion.motion_ends - 1)
     frames = torch.where(on_last, frames - 1, frames)
@@ -781,6 +859,14 @@ class MotionCommandCfg(CommandTermCfg):
   adaptive_alpha: float = 0.001
   adaptive_clip: float = 100.0
   sampling_mode: Literal["adaptive", "uniform", "start", "external"] = "adaptive"
+  hold_fraction: float = 0.0
+  """Share of the resampled environments that hold a still pose, without velocity,
+  instead of following a motion: what a command that stays where it is asks for.
+  0: none."""
+  hold_steps: int = 250
+  """Steps a pose is held before the environment is resampled (5 s at 50 Hz)."""
+  hold_clips: int = 2048
+  """Different still poses to hold, drawn from the motions' still frames."""
 
   @dataclass
   class VizCfg:
