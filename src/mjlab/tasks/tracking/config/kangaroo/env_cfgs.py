@@ -1,5 +1,6 @@
 """PAL Kangaroo flat tracking environment configurations."""
 
+import re
 from dataclasses import dataclass, fields
 
 import torch
@@ -13,6 +14,7 @@ from mjlab.asset_zoo.robots import (
 from mjlab.asset_zoo.robots.pal_kangaroo.kangaroo_constants import (
   KANGAROO_ACTUATORS,
   KANGAROO_GRIPPERS_ACTUATORS,
+  get_kangaroo_grippers_spec,
   kangaroo_passive_leg_joints,
 )
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
@@ -142,9 +144,10 @@ def pal_kangaroo_grippers_flat_tracking_env_cfg(
 ) -> ManagerBasedRlEnvCfg:
   """Create PAL Kangaroo grippers flat terrain tracking configuration.
 
-  The 4-DoF configuration with the 7-DoF arms: their wrist is the hand. The link
-  before it is tracked too: the wrist has two joint solutions for one pose of the
-  hand, which that link tells apart.
+  The 4-DoF configuration with the 7-DoF arms: their wrist is the hand. It tracks
+  every link that an actuated joint moves, so that the pose of its own link pins
+  each joint. With the 4-DoF bodies alone, the wrist (three joints up to the hand)
+  has two joint solutions for one pose of the hand.
   """
   cfg = pal_kangaroo_flat_tracking_env_cfg(play=play)
 
@@ -163,9 +166,12 @@ def pal_kangaroo_grippers_flat_tracking_env_cfg(
     "arm_left_tip_link": "arm_left_7_link",
     "arm_right_tip_link": "arm_right_7_link",
   }
-  motion_cmd.body_names = tuple(hand.get(b, b) for b in motion_cmd.body_names) + (
-    "arm_left_6_link",
-    "arm_right_6_link",
+  # The base first: the tracking rewards take the first body as the root.
+  spec = get_kangaroo_grippers_spec()
+  motion_cmd.body_names = ("base_link",) + tuple(
+    joint.parent.name
+    for joint in spec.joints
+    if any(re.fullmatch(expr, joint.name) for expr in motion_cmd.joint_names)
   )
   ee_body_pos = cfg.terminations["ee_body_pos"].params
   ee_body_pos["body_names"] = tuple(hand.get(b, b) for b in ee_body_pos["body_names"])
