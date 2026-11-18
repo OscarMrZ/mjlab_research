@@ -7,6 +7,8 @@ closed on it by an equality constraint (``leg_*_femur_joint``,
 """
 
 import math
+import os
+import re
 from pathlib import Path
 
 import mujoco
@@ -50,8 +52,9 @@ def get_kangaroo_grippers_spec() -> mujoco.MjSpec:
 ##
 
 # Stiffness and damping put each joint's armature at this natural frequency and
-# damping ratio.
-NATURAL_FREQ = 3.5 * 2.0 * 3.1415926535  # 3.5 Hz
+# damping ratio. KANGAROO_NATURAL_FREQ_HZ sets another frequency, to try one out.
+NATURAL_FREQ_HZ = float(os.environ.get("KANGAROO_NATURAL_FREQ_HZ", 3.5))
+NATURAL_FREQ = NATURAL_FREQ_HZ * 2.0 * 3.1415926535
 DAMPING_RATIO = 2.0
 
 
@@ -180,28 +183,41 @@ def get_kangaroo_grippers_robot_cfg() -> EntityCfg:
   )
 
 
-# Natural frequency [Hz] of the gains the arm and waist action scales are computed
-# for. At the robot's 3.5 Hz gains these scales are 12 times smaller: too little
-# exploration per unit of action noise, and too high an action-rate cost per radian.
-ARM_WAIST_ACTION_SCALE_FREQ_HZ = 1.0
+# Some joints take the action scale of softer gains than their own: those of the
+# natural frequency ARM_WAIST_ACTION_SCALE_FREQ_HZ [Hz]. At the robot's 3.5 Hz gains
+# the scale is 12 times smaller than at 1 Hz: too little exploration per unit of
+# action noise, and too high an action-rate cost per radian. They are the arm and
+# waist joints unless KANGAROO_ACTION_SCALE_FREQ_JOINTS names others, as a regular
+# expression on the joint name; KANGAROO_ARM_WAIST_ACTION_SCALE_FREQ_HZ sets another
+# frequency. Both are there to try values out.
+ARM_WAIST_ACTION_SCALE_FREQ_HZ = float(
+  os.environ.get("KANGAROO_ARM_WAIST_ACTION_SCALE_FREQ_HZ", 1.0)
+)
+ACTION_SCALE_FREQ_JOINTS = os.environ.get(
+  "KANGAROO_ACTION_SCALE_FREQ_JOINTS", r"(?!leg_).*"
+)
 
 
-def _action_scale(articulation: EntityArticulationInfoCfg) -> dict[str, float]:
+def _action_scale(
+  articulation: EntityArticulationInfoCfg, spec: mujoco.MjSpec
+) -> dict[str, float]:
+  """A quarter of the effort limit over the stiffness, of each actuated joint."""
   scale: dict[str, float] = {}
   for a in articulation.actuators:
     assert isinstance(a, BuiltinPositionActuatorCfg)
-    e = a.effort_limit
-    s = a.stiffness
-    assert e is not None and a.armature is not None
-    for n in a.target_names_expr:
-      if not n.startswith("leg_"):
-        s = a.armature * (2.0 * math.pi * ARM_WAIST_ACTION_SCALE_FREQ_HZ) ** 2
-      scale[n] = 0.25 * e / s
+    assert a.effort_limit is not None and a.armature is not None
+    soft = a.armature * (2.0 * math.pi * ARM_WAIST_ACTION_SCALE_FREQ_HZ) ** 2
+    for joint in spec.joints:
+      if any(re.fullmatch(expr, joint.name) for expr in a.target_names_expr):
+        softer = re.fullmatch(ACTION_SCALE_FREQ_JOINTS, joint.name)
+        scale[joint.name] = 0.25 * a.effort_limit / (soft if softer else a.stiffness)
   return scale
 
 
-KANGAROO_ACTION_SCALE = _action_scale(KANGAROO_ARTICULATION)
-KANGAROO_GRIPPERS_ACTION_SCALE = _action_scale(KANGAROO_GRIPPERS_ARTICULATION)
+KANGAROO_ACTION_SCALE = _action_scale(KANGAROO_ARTICULATION, get_kangaroo_spec())
+KANGAROO_GRIPPERS_ACTION_SCALE = _action_scale(
+  KANGAROO_GRIPPERS_ARTICULATION, get_kangaroo_grippers_spec()
+)
 
 ##
 # Closed-chain leg.
