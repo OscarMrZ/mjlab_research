@@ -22,6 +22,7 @@ from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.tracking.mdp import MotionCommand, MotionCommandCfg
 from mjlab.tasks.tracking.tracking_env_cfg import make_tracking_env_cfg
+from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 
 class KangarooMotionCommand(MotionCommand):
@@ -75,6 +76,9 @@ def pal_kangaroo_flat_tracking_env_cfg(
   joint_pos_action = cfg.actions["joint_pos"]
   assert isinstance(joint_pos_action, JointPositionActionCfg)
   joint_pos_action.scale = KANGAROO_ACTION_SCALE
+
+  # Make the policy trust joint vel more
+  cfg.observations["actor"].terms["joint_vel"].noise = Unoise(n_min=-0.05, n_max=0.05)
 
   base_cmd = cfg.commands["motion"]
   assert isinstance(base_cmd, MotionCommandCfg)
