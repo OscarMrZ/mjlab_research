@@ -54,7 +54,10 @@ def get_kangaroo_grippers_spec() -> mujoco.MjSpec:
 # Stiffness and damping put each joint's armature at this natural frequency and
 # damping ratio. KANGAROO_NATURAL_FREQ_HZ sets another frequency, to try one out.
 NATURAL_FREQ_HZ = float(os.environ.get("KANGAROO_NATURAL_FREQ_HZ", 3.5))
-NATURAL_FREQ = NATURAL_FREQ_HZ * 2.0 * 3.1415926535
+# The ankle and leg length joints can take another one, to try it out.
+ANKLE_LENGTH_NATURAL_FREQ_HZ = float(
+  os.environ.get("KANGAROO_ANKLE_LENGTH_NATURAL_FREQ_HZ", NATURAL_FREQ_HZ)
+)
 DAMPING_RATIO = 2.0
 
 
@@ -64,11 +67,13 @@ def _actuator(
   armature: float,
   frictionloss: float | None = None,
   viscous_damping: float | None = None,
+  natural_freq_hz: float = NATURAL_FREQ_HZ,
 ) -> BuiltinPositionActuatorCfg:
+  natural_freq = natural_freq_hz * 2.0 * 3.1415926535
   return BuiltinPositionActuatorCfg(
     target_names_expr=target_names_expr,
-    stiffness=round(armature * NATURAL_FREQ**2, 3),
-    damping=round(2.0 * DAMPING_RATIO * armature * NATURAL_FREQ, 3),
+    stiffness=round(armature * natural_freq**2, 3),
+    damping=round(2.0 * DAMPING_RATIO * armature * natural_freq, 3),
     effort_limit=effort_limit,
     armature=armature,
     frictionloss=frictionloss,
@@ -85,11 +90,16 @@ KANGAROO_ACTUATORS = (
   _actuator(("leg_.*_1_joint",), 80.0, 0.25, 0.9, 1.65),
   _actuator(("leg_.*_2_joint",), 230.0, 0.5, 4.0, 6.49),
   _actuator(("leg_.*_3_joint",), 139.0, 0.2, 2.34, 2.705),
-  _actuator(("leg_.*_4_joint",), 140.0, 0.1, 1.25, 2.8),
-  _actuator(("leg_.*_5_joint",), 82.0, 0.05, 0.8, 1.0),
+  _actuator(("leg_.*_4_joint",), 140.0, 0.1, 1.25, 2.8, ANKLE_LENGTH_NATURAL_FREQ_HZ),
+  _actuator(("leg_.*_5_joint",), 82.0, 0.05, 0.8, 1.0, ANKLE_LENGTH_NATURAL_FREQ_HZ),
   # The armature of the leg length joint is the actuator inertia times the
   # velocity ratio, which is not constant: its average value is used.
-  _actuator(("leg_.*_length_joint",), 1100.0, 4.1),
+  _actuator(
+    ("leg_.*_length_joint",),
+    1100.0,
+    4.1,
+    natural_freq_hz=ANKLE_LENGTH_NATURAL_FREQ_HZ,
+  ),
   _actuator(
     ("arm_.*_1_joint", "arm_.*_2_joint", "pelvis_1_joint", "pelvis_2_joint"),
     50.0,
